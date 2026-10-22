@@ -1,0 +1,71 @@
+# CD: merge vào main -> chạy lại CI -> chờ người duyệt -> deploy lên VM.
+#
+#   ci (gọi lại ci.yml) ──> deploy (environment: production, cần người duyệt)
+#
+# Cần khai báo trong Settings > Environments > production (xem file hướng dẫn):
+#   Secrets:   VM_SSH_KEY      private key dành riêng cho GitHub Actions
+#              VM_KNOWN_HOSTS  dấu vân tay của VM (ssh-keyscan), chống SSH nhầm máy giả
+#   Variables: VM_HOST         IP / tên miền của VM
+#              VM_USER         user deploy trên VM (ví dụ: deploy)
+#
+# VM chỉ cho key này chạy ĐÚNG 1 lệnh: /opt/deploy/deploy.sh (forced command),
+# nên lệnh ssh ở dưới không cần ghi lệnh gì.
+
+name: CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # deploy lại bằng tay (ví dụ sau khi sửa .env trên VM)
+
+permissions:
+  contents: read
+
+# 2 lần merge sát nhau -> lần sau xếp hàng chờ lần trước xong, không deploy chồng lên nhau
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    name: Deploy lên VM
+    needs: ci
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 20
+    env:
+      VM_HOST: ${{ vars.VM_HOST }}
+      VM_USER: ${{ vars.VM_USER }}
+    steps:
+      - name: Kiểm tra đã khai báo đủ secret / variable
+        env:
+          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+          VM_KNOWN_HOSTS: ${{ secrets.VM_KNOWN_HOSTS }}
+        run: |
+          for name in VM_SSH_KEY VM_KNOWN_HOSTS VM_HOST VM_USER; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Thiếu $name trong Settings > Environments > production"
+              exit 1
+            fi
+          done
+
+      - name: Chuẩn bị SSH key
+        env:
+          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+          VM_KNOWN_HOSTS: ${{ secrets.VM_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$VM_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$VM_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      - name: Chạy script deploy trên VM
+        run: ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o ConnectTimeout=20 "$VM_USER@$VM_HOST"
+
+      - name: Xoá key khỏi máy chạy
+        if: always()
+        run: rm -f ~/.ssh/deploy_key

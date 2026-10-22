@@ -1,0 +1,116 @@
+# CI: kiểm tra code TRƯỚC KHI vào nhánh main.
+#
+# Chạy khi: mở / cập nhật Pull Request vào main, hoặc được cd.yml gọi lại trước khi deploy.
+# Job nào đỏ -> PR không merge được (bật Branch protection, xem file hướng dẫn).
+#
+#   lint ──┬── unit-test       logic Python: ngày chạy, câu SQL, data contract JSON <-> SQL
+#          ├── dag-integrity   mở mọi DAG bằng đúng Airflow 3.3.2: lỗi import, luật team
+#          └── docker-build    image Airflow build được (Dockerfile + requirements.txt)
+#   secret-scan                không có key / mật khẩu nào lọt vào code (chạy song song)
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_call: # cd.yml gọi workflow này
+  workflow_dispatch: # bấm chạy tay ở tab Actions
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12" # khớp Python trong image apache/airflow:3.3.2
+  AIRFLOW_VERSION: "3.3.2" # khớp dòng FROM trong Dockerfile
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cài ruff
+        run: pip install ruff==0.17.1
+
+      - name: Ruff check (lỗi code + luật Airflow 3)
+        run: ruff check --output-format=github .
+
+      - name: Ruff format (đúng format chung của team)
+        run: ruff format --check .
+
+  unit-test:
+    name: unit-test
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Cài thư viện test
+        run: pip install -r requirements-dev.txt
+
+      - name: Chạy unit test (không cần Airflow, không gọi BigQuery)
+        run: pytest tests/unit -v
+
+  dag-integrity:
+    name: dag-integrity
+    needs: lint
+    runs-on: ubuntu-latest
+    env:
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Cài Airflow + provider đúng version production
+        run: |
+          pip install "apache-airflow==${AIRFLOW_VERSION}" -r requirements.txt pytest \
+            --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"
+
+      - name: Mở mọi DAG, kiểm tra lỗi import và luật team
+        run: pytest tests/integrity -v
+
+  docker-build:
+    name: docker-build
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build image Airflow (giống bước build trên VM)
+        run: docker build -t candy-crush-airflow:ci .
+
+  secret-scan:
+    name: secret-scan
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: "8.30.1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # lấy toàn bộ lịch sử: key đã commit rồi xoá vẫn bị bắt
+
+      - name: Cài gitleaks
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz gitleaks
+
+      # --log-opts=HEAD: chỉ quét lịch sử của code đang kiểm tra (main + commit của PR này),
+      # không quét các branch khác trong repo
+      - name: Quét key / mật khẩu trong lịch sử commit
+        run: ./gitleaks git --redact --verbose --log-opts="HEAD" .
