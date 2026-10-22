@@ -18,7 +18,7 @@ from candycrush.sql_builder import build_split_sql, flat_table, load_events, ren
 # ----------------------------------------------------------------------
 
 # Ngày cần chạy, dạng YYYYMMDD
-RUN_DATE = "20261010"
+RUN_DATE = "20261011"
 
 
 with DAG(
